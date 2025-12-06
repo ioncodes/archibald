@@ -282,30 +282,35 @@ impl Parse for InstructionTable {
 #[derive(Debug, Clone)]
 struct ParsedPattern {
     /// Fixed bits mask (1 = fixed, 0 = variable or wildcard)
-    mask: u8,
+    mask: u64,
     /// Expected values for fixed bits
-    value: u8,
+    value: u64,
     /// Map from variable name to (start_bit, num_bits)
     variables: HashMap<String, (u8, u8)>,
     /// Wildcard bit positions (e.g. immediates)
-    wildcard_bits: u8,
+    wildcard_bits: u64,
+    /// Number of bits in the pattern (8, 16, 32, or 64)
+    bit_width: usize,
 }
 
 fn parse_pattern(pattern: &str) -> ParsedPattern {
     let pattern = pattern.trim();
+    let bit_width = pattern.len();
+
     assert!(
-        pattern.len() == 8,
-        "Pattern must be exactly 8 bits: {}",
+        bit_width == 8 || bit_width == 16 || bit_width == 32 || bit_width == 64,
+        "Pattern must be exactly 8, 16, 32, or 64 bits. Got {} bits: {}",
+        bit_width,
         pattern
     );
 
-    let mut mask = 0u8;
-    let mut value = 0u8;
-    let mut wildcard_bits = 0u8;
+    let mut mask = 0u64;
+    let mut value = 0u64;
+    let mut wildcard_bits = 0u64;
     let mut var_positions: HashMap<char, Vec<u8>> = HashMap::new();
 
     for (i, ch) in pattern.chars().enumerate() {
-        let bit_pos = 7 - i as u8; // MSB first
+        let bit_pos = (bit_width - 1 - i) as u8; // MSB first
 
         match ch {
             '0' => {
@@ -343,6 +348,7 @@ fn parse_pattern(pattern: &str) -> ParsedPattern {
         value,
         variables,
         wildcard_bits,
+        bit_width,
     }
 }
 
@@ -350,7 +356,7 @@ fn parse_pattern(pattern: &str) -> ParsedPattern {
 fn generate_opcode_variants(
     pattern: &ParsedPattern,
     bindings: &[VariableBinding],
-) -> Vec<(u8, Vec<(String, Ident, Ident)>)> {
+) -> Vec<(u64, Vec<(String, Ident, Ident)>)> {
     // Build a list of (var_name, bit_pos, num_bits, mappings)
     let mut var_info: Vec<(&str, u8, u8, &[BitMapping])> = Vec::new();
 
@@ -373,11 +379,11 @@ fn generate_opcode_variants(
 }
 
 fn generate_combinations(
-    current_opcode: u8,
+    current_opcode: u64,
     var_info: &[(&str, u8, u8, &[BitMapping])],
     index: usize,
     current_bindings: Vec<(String, Ident, Ident)>,
-    results: &mut Vec<(u8, Vec<(String, Ident, Ident)>)>,
+    results: &mut Vec<(u64, Vec<(String, Ident, Ident)>)>,
 ) {
     if index >= var_info.len() {
         results.push((current_opcode, current_bindings));
@@ -387,7 +393,7 @@ fn generate_combinations(
     let (var_name, bit_pos, _num_bits, mappings) = &var_info[index];
 
     for mapping in *mappings {
-        let bits_value = u8::from_str_radix(&mapping.bits, 2).expect("Invalid binary string");
+        let bits_value = u64::from_str_radix(&mapping.bits, 2).expect("Invalid binary string");
         let new_opcode = current_opcode | (bits_value << bit_pos);
 
         let mut new_bindings = current_bindings.clone();
@@ -398,6 +404,26 @@ fn generate_combinations(
         ));
 
         generate_combinations(new_opcode, var_info, index + 1, new_bindings, results);
+    }
+}
+
+fn make_literal(value: u64, bit_width: usize) -> proc_macro2::Literal {
+    match bit_width {
+        8 => proc_macro2::Literal::u8_suffixed(value as u8),
+        16 => proc_macro2::Literal::u16_suffixed(value as u16),
+        32 => proc_macro2::Literal::u32_suffixed(value as u32),
+        64 => proc_macro2::Literal::u64_suffixed(value),
+        _ => panic!("Unsupported bit width: {}", bit_width),
+    }
+}
+
+fn make_full_mask(bit_width: usize) -> u64 {
+    match bit_width {
+        8 => 0xFF,
+        16 => 0xFFFF,
+        32 => 0xFFFF_FFFF,
+        64 => 0xFFFF_FFFF_FFFF_FFFF,
+        _ => panic!("Unsupported bit width: {}", bit_width),
     }
 }
 
@@ -457,10 +483,11 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
 
     // Collect all match arms
     let mut match_arms = Vec::new();
-    let mut seen_patterns: Vec<(u8, u8)> = Vec::new(); // (mask, value) pairs
+    let mut seen_patterns: Vec<(u64, u64)> = Vec::new(); // (mask, value) pairs
 
     for entry in &table.entries {
         let pattern = parse_pattern(&entry.pattern);
+        let bit_width = pattern.bit_width;
         let bindings = entry
             .where_clause
             .as_ref()
@@ -495,13 +522,14 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
                         generate_handler_call(&entry.handler, &var_bindings, &entry.where_clause);
 
                     // Check if this pattern overlaps with existing ones
+                    let full_mask = make_full_mask(bit_width);
                     let dominated = seen_patterns
                         .iter()
-                        .any(|(m, v)| *m == 0xFF && *v == opcode);
+                        .any(|(m, v)| *m == full_mask && *v == opcode);
 
                     if !dominated {
-                        let mask_lit = proc_macro2::Literal::u8_suffixed(expanded_mask);
-                        let value_lit = proc_macro2::Literal::u8_suffixed(opcode);
+                        let mask_lit = make_literal(expanded_mask, bit_width);
+                        let value_lit = make_literal(opcode, bit_width);
                         match_arms.push(quote! {
                             op if op & #mask_lit == #value_lit => { #handler_call }
                         });
@@ -509,14 +537,15 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
                     }
                 } else {
                     // Exact match
-                    let key = (0xFF, opcode);
+                    let full_mask = make_full_mask(bit_width);
+                    let key = (full_mask, opcode);
                     if !seen_patterns.contains(&key) {
                         let handler_call = generate_handler_call(
                             &entry.handler,
                             &var_bindings,
                             &entry.where_clause,
                         );
-                        let opcode_lit = proc_macro2::Literal::u8_suffixed(opcode);
+                        let opcode_lit = make_literal(opcode, bit_width);
                         match_arms.push(quote! {
                             #opcode_lit => { #handler_call }
                         });
@@ -530,8 +559,8 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
             let value = pattern.value;
             let handler_call = generate_handler_call(&entry.handler, &[], &entry.where_clause);
 
-            let mask_lit = proc_macro2::Literal::u8_suffixed(mask);
-            let value_lit = proc_macro2::Literal::u8_suffixed(value);
+            let mask_lit = make_literal(mask, bit_width);
+            let value_lit = make_literal(value, bit_width);
             match_arms.push(quote! {
                 op if op & #mask_lit == #value_lit => { #handler_call }
             });
@@ -539,10 +568,11 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
         } else {
             // Fixed pattern, exact match
             let opcode = pattern.value;
-            let key = (0xFF, opcode);
+            let full_mask = make_full_mask(bit_width);
+            let key = (full_mask, opcode);
             if !seen_patterns.contains(&key) {
                 let handler_call = generate_handler_call(&entry.handler, &[], &entry.where_clause);
-                let opcode_lit = proc_macro2::Literal::u8_suffixed(opcode);
+                let opcode_lit = make_literal(opcode, bit_width);
                 match_arms.push(quote! {
                     #opcode_lit => { #handler_call }
                 });
