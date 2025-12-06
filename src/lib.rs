@@ -295,13 +295,17 @@ struct ParsedPattern {
 
 fn parse_pattern(pattern: &str) -> ParsedPattern {
     let pattern = pattern.trim();
-    let bit_width = pattern.len();
+
+    // Remove single quotes (visual separators)
+    let pattern_clean: String = pattern.chars().filter(|&c| c != '\'').collect();
+    let bit_width = pattern_clean.len();
 
     assert!(
         bit_width == 8 || bit_width == 16 || bit_width == 32 || bit_width == 64,
-        "Pattern must be exactly 8, 16, 32, or 64 bits. Got {} bits: {}",
+        "Pattern must be exactly 8, 16, 32, or 64 bits. Got {} bits: {} (cleaned: {})",
         bit_width,
-        pattern
+        pattern,
+        pattern_clean
     );
 
     let mut mask = 0u64;
@@ -309,7 +313,7 @@ fn parse_pattern(pattern: &str) -> ParsedPattern {
     let mut wildcard_bits = 0u64;
     let mut var_positions: HashMap<char, Vec<u8>> = HashMap::new();
 
-    for (i, ch) in pattern.chars().enumerate() {
+    for (i, ch) in pattern_clean.chars().enumerate() {
         let bit_pos = (bit_width - 1 - i) as u8; // MSB first
 
         match ch {
@@ -329,7 +333,7 @@ fn parse_pattern(pattern: &str) -> ParsedPattern {
                 var_positions.entry(c).or_default().push(bit_pos);
             }
             _ => panic!(
-                "Invalid pattern character: '{}'. Use 0/1 for fixed bits, a-z for variables, _ or . for wildcards",
+                "Invalid pattern character: '{}'. Use 0/1 for fixed bits, a-z for variables, _ or . for wildcards, ' for visual separation",
                 ch
             ),
         }
