@@ -9,14 +9,19 @@
 //!
 //!     dispatcher = dispatch;
 //!     context = Cpu;
-//!     
-//!     // LDA immediate - pattern with variable addressing mode bits
-//!     "101000mm" => Load<AddrMode::{mm}> where {
+//!
+//!     // pattern with manual mapping
+//!     "101000mm" => impl_load<AddrMode::{mm}> where {
 //!         mm: AddrMode = { 00 => Immediate, 01 => ZeroPage, 10 => Absolute, 11 => IndirectY }
 //!     };
-//!     
+//!
+//!     // pattern with const function mapping
+//!     "101001mm" => impl_load<AddrMode::{mm}> where {
+//!         mm: AddrMode = decode_addressing_mode(mm)
+//!     };
+//!
 //!     // Fixed opcode
-//!     "00011000" => Clc;
+//!     "00011000" => impl_nop;
 //! }
 //! ```
 
@@ -57,11 +62,18 @@ impl Parse for BitMapping {
     }
 }
 
-/// A variable binding: r: Register = { 0b00 => R0, ... } or r = { 0b00 => R0, ... }
+/// A variable binding: r: Register = { 0b00 => R0, ... } or r: Register = translate_register(r)
+enum BindingValue {
+    /// Manual mapping: { 0b00 => R0, 0b01 => R1, ... }
+    Mappings(Vec<BitMapping>),
+    /// Const function call: translate_register(r)
+    ConstFn(TokenStream2),
+}
+
 struct VariableBinding {
     name: String,
     _enum_type: Option<Ident>,
-    mappings: Vec<BitMapping>,
+    value: BindingValue,
 }
 
 impl Parse for VariableBinding {
@@ -79,16 +91,48 @@ impl Parse for VariableBinding {
 
         input.parse::<Token![=]>()?;
 
-        let content;
-        braced!(content in input);
+        let value = if input.peek(token::Brace) {
+            // Manual mapping: { 0b00 => R0, ... }
+            let content;
+            braced!(content in input);
 
-        let mappings: Punctuated<BitMapping, Token![,]> =
-            content.parse_terminated(BitMapping::parse, Token![,])?;
+            let mappings: Punctuated<BitMapping, Token![,]> =
+                content.parse_terminated(BitMapping::parse, Token![,])?;
+
+            BindingValue::Mappings(mappings.into_iter().collect())
+        } else {
+            // Const function call: translate_register(r)
+            // Parse until we hit a comma (end of this binding) or the end of input
+            let mut tokens = TokenStream2::new();
+            while !input.is_empty() && !input.peek(Token![,]) {
+                if input.peek(token::Paren) {
+                    let content;
+                    syn::parenthesized!(content in input);
+                    let inner: TokenStream2 = content.parse()?;
+                    tokens.extend(quote! { ( #inner ) });
+                } else if input.peek(token::Bracket) {
+                    let content;
+                    syn::bracketed!(content in input);
+                    let inner: TokenStream2 = content.parse()?;
+                    tokens.extend(quote! { [ #inner ] });
+                } else if input.peek(token::Brace) {
+                    let content;
+                    braced!(content in input);
+                    let inner: TokenStream2 = content.parse()?;
+                    tokens.extend(quote! { { #inner } });
+                } else {
+                    let tt: proc_macro2::TokenTree = input.parse()?;
+                    tokens.extend(std::iter::once(tt));
+                }
+            }
+
+            BindingValue::ConstFn(tokens)
+        };
 
         Ok(VariableBinding {
             name,
             _enum_type: enum_type,
-            mappings: mappings.into_iter().collect(),
+            value,
         })
     }
 }
@@ -360,13 +404,13 @@ fn parse_pattern(pattern: &str) -> ParsedPattern {
 fn generate_opcode_variants(
     pattern: &ParsedPattern,
     bindings: &[VariableBinding],
-) -> Vec<(u64, Vec<(String, Ident, Ident)>)> {
-    // Build a list of (var_name, bit_pos, num_bits, mappings)
-    let mut var_info: Vec<(&str, u8, u8, &[BitMapping])> = Vec::new();
+) -> Vec<(u64, Vec<(String, Ident, TokenStream2)>)> {
+    // Build a list of (var_name, bit_pos, num_bits, value)
+    let mut var_info: Vec<(&str, u8, u8, &BindingValue)> = Vec::new();
 
     for binding in bindings {
         if let Some(&(bit_pos, num_bits)) = pattern.variables.get(&binding.name) {
-            var_info.push((&binding.name, bit_pos, num_bits, &binding.mappings));
+            var_info.push((&binding.name, bit_pos, num_bits, &binding.value));
         }
     }
 
@@ -384,31 +428,86 @@ fn generate_opcode_variants(
 
 fn generate_combinations(
     current_opcode: u64,
-    var_info: &[(&str, u8, u8, &[BitMapping])],
+    var_info: &[(&str, u8, u8, &BindingValue)],
     index: usize,
-    current_bindings: Vec<(String, Ident, Ident)>,
-    results: &mut Vec<(u64, Vec<(String, Ident, Ident)>)>,
+    current_bindings: Vec<(String, Ident, TokenStream2)>,
+    results: &mut Vec<(u64, Vec<(String, Ident, TokenStream2)>)>,
 ) {
     if index >= var_info.len() {
         results.push((current_opcode, current_bindings));
         return;
     }
 
-    let (var_name, bit_pos, _num_bits, mappings) = &var_info[index];
+    let (var_name, bit_pos, num_bits, binding_value) = &var_info[index];
 
-    for mapping in *mappings {
-        let bits_value = u64::from_str_radix(&mapping.bits, 2).expect("Invalid binary string");
-        let new_opcode = current_opcode | (bits_value << bit_pos);
+    match binding_value {
+        BindingValue::Mappings(mappings) => {
+            // Manual mapping: expand all bit patterns
+            for mapping in mappings {
+                let bits_value =
+                    u64::from_str_radix(&mapping.bits, 2).expect("Invalid binary string");
+                let new_opcode = current_opcode | (bits_value << bit_pos);
 
-        let mut new_bindings = current_bindings.clone();
-        new_bindings.push((
-            var_name.to_string(),
-            format_ident!("{}", var_name),
-            mapping.variant.clone(),
-        ));
+                let mut new_bindings = current_bindings.clone();
+                let variant = &mapping.variant;
+                new_bindings.push((
+                    var_name.to_string(),
+                    format_ident!("{}", var_name),
+                    quote! { #variant },
+                ));
 
-        generate_combinations(new_opcode, var_info, index + 1, new_bindings, results);
+                generate_combinations(new_opcode, var_info, index + 1, new_bindings, results);
+            }
+        }
+        BindingValue::ConstFn(fn_expr) => {
+            // Const function: expand all possible bit values
+            let max_value = (1u64 << num_bits) - 1;
+            for bits_value in 0..=max_value {
+                let new_opcode = current_opcode | (bits_value << bit_pos);
+
+                let mut new_bindings = current_bindings.clone();
+                let var_ident = format_ident!("{}", var_name);
+
+                // Substitute the variable with the bit value in the expression
+                // The expression is like "translate_register(r)" and we need to replace 'r' with the actual value
+                let substituted = substitute_variable(fn_expr, var_name, bits_value);
+
+                new_bindings.push((var_name.to_string(), var_ident, substituted));
+
+                generate_combinations(new_opcode, var_info, index + 1, new_bindings, results);
+            }
+        }
     }
+}
+
+/// Substitute a variable name in a token stream with a literal bit value
+fn substitute_variable(tokens: &TokenStream2, var_name: &str, bit_value: u64) -> TokenStream2 {
+    let var_ident = format_ident!("{}", var_name);
+    let bit_lit = proc_macro2::Literal::u8_suffixed(bit_value as u8);
+
+    let mut result = TokenStream2::new();
+
+    for tt in tokens.clone().into_iter() {
+        match tt {
+            proc_macro2::TokenTree::Ident(ref ident) if ident == &var_ident => {
+                // Replace variable with bit value
+                result.extend(std::iter::once(proc_macro2::TokenTree::Literal(
+                    bit_lit.clone(),
+                )));
+            }
+            proc_macro2::TokenTree::Group(group) => {
+                // Recursively process grouped tokens
+                let inner = substitute_variable(&group.stream(), var_name, bit_value);
+                let new_group = proc_macro2::Group::new(group.delimiter(), inner);
+                result.extend(std::iter::once(proc_macro2::TokenTree::Group(new_group)));
+            }
+            _ => {
+                result.extend(std::iter::once(tt));
+            }
+        }
+    }
+
+    result
 }
 
 fn make_literal(value: u64, bit_width: usize) -> proc_macro2::Literal {
@@ -433,7 +532,7 @@ fn make_full_mask(bit_width: usize) -> u64 {
 
 fn generate_handler_call(
     handler: &HandlerSpec,
-    bindings: &[(String, Ident, Ident)],
+    bindings: &[(String, Ident, TokenStream2)],
     _where_clause: &Option<WhereClause>,
 ) -> TokenStream2 {
     let handler_name = &handler.name;
@@ -446,16 +545,24 @@ fn generate_handler_call(
                 enum_type,
                 var_name,
             } => {
-                // Find the variant for this variable
-                let variant = bindings
+                // Find the value for this variable
+                let value = bindings
                     .iter()
                     .find(|(name, _, _)| name == var_name)
-                    .map(|(_, _, variant)| variant)
+                    .map(|(_, _, value)| value)
                     .unwrap_or_else(|| {
                         panic!("Variable '{}' not found in where clause bindings", var_name)
                     });
-                // Wrap in braces for const generic
-                quote! { { #enum_type::#variant } }
+
+                // Check if the value is a simple identifier (enum variant)
+                let value_str = value.to_string();
+                if value_str.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    // Simple variant name, add enum prefix
+                    quote! { { #enum_type::#value } }
+                } else {
+                    // Already a complex expression (function call), wrap in braces
+                    quote! { { #value } }
+                }
             }
             GenericArg::Fixed(tokens) => {
                 // Check if already wrapped in braces
