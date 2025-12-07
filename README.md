@@ -15,10 +15,10 @@ Using const generics to specialize handlers at compile time:
 archibald::instruction_table! {
     type Opcode = u8;
 
-    dispatcher = dispatch; // "dispatch" is the generated function that dispatches the instructrion
+    dispatcher = dispatch; // "dispatch" is the generated function that dispatches the instruction
     context = Cpu;         // Your abstraction over the emulated context
 
-    // Pattern with variables, expands to 4 specialized opcodes/implemenations
+    // Pattern with variables, expands to 4 specialized opcodes/implementations
     "0001'rr__" => op_inc<Register::{r}> where {
         r: Register = {
             0b00 => R0,
