@@ -2,6 +2,9 @@
 
 A Rust proc-macro for building high-performance instruction decoders with **compile-time branch elimination** using const generics.
 
+## What?
+Since this allows you to declaratively map specific bit patterns (e.g. `1010xxyy`) to constant generic parameters the compiler will treat each specialization as a new "function", effectively eliminating all branches that operate on the parameters. See the following example.
+
 ## Examples
 - [Brainfuck](./examples/brainfuck.rs) - Very simple Brainfuck interpreter without const generics
 - [Simple VM](./examples/simple_vm.rs) - Showcases how const generics are used
@@ -15,8 +18,8 @@ archibald::instruction_table! {
     dispatcher = dispatch; // "dispatch" is the generated function that dispatches the instructrion
     context = Cpu;         // Your abstraction over the emulated context
 
-    // Pattern with variables, expands to 4 specialized opcodes
-    "0001'rr00" => op_inc<Register::{r}> where {
+    // Pattern with variables, expands to 4 specialized opcodes/implemenations
+    "0001'rr__" => op_inc<Register::{r}> where {
         r: Register = {
             0b00 => R0,
             0b01 => R1,
@@ -24,16 +27,14 @@ archibald::instruction_table! {
             0b11 => R3
         }
     };
+}
 
-    // Pattern with wildcards AND variables
-    "0010'rr__" => op_load<Register::{r}> where {
-        r: Register = {
-            0b00 => R0,
-            0b01 => R1,
-            0b10 => R2,
-            0b11 => R3
-        }
-    };
+// The "mastch" is compiled away and instead the binary will contain a "op_inc" specialization for each case
+pub fn op_inc<const REG: Register>(vm: &mut Brainfuck, _opcode: u8) {
+    match REG {
+        Register::R0 => /* ... */,
+        Register::R1 => /* ... */,
+    }
 }
 ```
 

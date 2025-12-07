@@ -1,5 +1,3 @@
-#![feature(adt_const_params)]
-
 pub struct Brainfuck {
     pub memory: [u8; 30000],
     pub ptr: usize,
@@ -76,6 +74,7 @@ pub fn op_loop_end(vm: &mut Brainfuck, _opcode: u8) {
     }
 }
 
+// Instruction table
 archibald::instruction_table! {
     type Opcode = u8;
 
