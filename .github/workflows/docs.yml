@@ -30,13 +30,10 @@ jobs:
       - name: Build documentation
         run: cargo doc --no-deps
 
-      - name: Add redirect index.html
-        run: echo '<meta http-equiv="refresh" content="0; url=archibald">' > target/doc/index.html
-
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './target/doc'
+          path: './target/doc/archibald'
 
   deploy:
     environment:
