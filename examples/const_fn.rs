@@ -30,11 +30,11 @@ archibald::instruction_table! {
     dispatcher = dispatch;
     context = ();
 
-    "00mm'____" => handler<Mode::{m}> where {
+    "00mm'____" => handler<{m}> where {
         m: Mode = decode_mode(m)
     };
 
-    "01mm'____" => handler<Mode::{m}> where {
+    "01mm'____" => handler<{m}> where {
         m: Mode = { 0b00 => A, 0b01 => B, 0b10 => C, 0b11 => D }
     };
 }

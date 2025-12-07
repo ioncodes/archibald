@@ -38,6 +38,7 @@ use syn::{
 };
 
 /// A single bit mapping: 0b00 => R0 or 00 => R0
+#[derive(Clone)]
 struct BitMapping {
     bits: String,
     variant: Ident,
@@ -63,6 +64,7 @@ impl Parse for BitMapping {
 }
 
 /// A variable binding: r: Register = { 0b00 => R0, ... } or r: Register = translate_register(r)
+#[derive(Clone)]
 enum BindingValue {
     /// Manual mapping: { 0b00 => R0, 0b01 => R1, ... }
     Mappings(Vec<BitMapping>),
@@ -164,8 +166,10 @@ struct HandlerSpec {
 }
 
 enum GenericArg {
-    /// A variable reference like AddrMode::{mm}
-    Variable { enum_type: Ident, var_name: String },
+    /// A variable reference with explicit type: AddrMode::{mm}
+    TypedVariable { enum_type: Ident, var_name: String },
+    /// A variable reference without type: {mm} - type inferred from where clause
+    UntypedVariable { var_name: String },
     /// A fixed type/const
     Fixed(TokenStream2),
 }
@@ -184,16 +188,35 @@ impl Parse for HandlerSpec {
                 }
 
                 // Try to parse:
-                // - EnumType::{var} (variable reference)
+                // - {var} (untyped variable reference - type inferred from where clause)
+                // - EnumType::{var} (typed variable reference)
                 // - EnumType::Variant (fixed path)
                 // - { expr } (const expr in braces)
                 // - Ident (simple type name)
                 if input.peek(token::Brace) {
-                    // { expr } - already braced const generic
+                    // { expr } - could be {var} or a const expression
                     let content;
                     braced!(content in input);
-                    let inner: TokenStream2 = content.parse()?;
-                    args.push(GenericArg::Fixed(quote! { { #inner } }));
+
+                    // Try to parse as a single identifier (variable reference)
+                    let fork = content.fork();
+                    if let Ok(var_ident) = fork.parse::<Ident>() {
+                        if fork.is_empty() {
+                            // It's a simple {var} - untyped variable reference
+                            let _: Ident = content.parse()?;
+                            args.push(GenericArg::UntypedVariable {
+                                var_name: var_ident.to_string(),
+                            });
+                        } else {
+                            // It's a complex expression
+                            let inner: TokenStream2 = content.parse()?;
+                            args.push(GenericArg::Fixed(quote! { { #inner } }));
+                        }
+                    } else {
+                        // It's a complex expression
+                        let inner: TokenStream2 = content.parse()?;
+                        args.push(GenericArg::Fixed(quote! { { #inner } }));
+                    }
                 } else if input.peek(Ident) {
                     let first_ident: Ident = input.parse()?;
 
@@ -201,12 +224,12 @@ impl Parse for HandlerSpec {
                         input.parse::<Token![::]>()?;
 
                         if input.peek(token::Brace) {
-                            // EnumType::{var} - variable reference
+                            // EnumType::{var} - typed variable reference
                             let inner;
                             braced!(inner in input);
                             let var_ident: Ident = inner.parse()?;
 
-                            args.push(GenericArg::Variable {
+                            args.push(GenericArg::TypedVariable {
                                 enum_type: first_ident,
                                 var_name: var_ident.to_string(),
                             });
@@ -406,11 +429,19 @@ fn generate_opcode_variants(
     bindings: &[VariableBinding],
 ) -> Vec<(u64, Vec<(String, Ident, TokenStream2)>)> {
     // Build a list of (var_name, bit_pos, num_bits, value)
-    let mut var_info: Vec<(&str, u8, u8, &BindingValue)> = Vec::new();
+    // For each variable in the pattern, either use the binding or create a raw u8 binding
+    let mut var_info: Vec<(&str, u8, u8, BindingValue)> = Vec::new();
 
-    for binding in bindings {
-        if let Some(&(bit_pos, num_bits)) = pattern.variables.get(&binding.name) {
-            var_info.push((&binding.name, bit_pos, num_bits, &binding.value));
+    for (var_name, &(bit_pos, num_bits)) in &pattern.variables {
+        // Check if this variable has a binding in the where clause
+        if let Some(binding) = bindings.iter().find(|b| &b.name == var_name) {
+            var_info.push((var_name, bit_pos, num_bits, binding.value.clone()));
+        } else {
+            // No binding, use raw bit value as u8
+            // Create a simple identity const function
+            let var_ident = format_ident!("{}", var_name);
+            let raw_value = BindingValue::ConstFn(quote! { #var_ident });
+            var_info.push((var_name, bit_pos, num_bits, raw_value));
         }
     }
 
@@ -421,11 +452,12 @@ fn generate_opcode_variants(
 
     // Generate all combinations
     let mut results = Vec::new();
-    generate_combinations(pattern.value, &var_info, 0, vec![], &mut results);
+    generate_combinations_owned(pattern.value, &var_info, 0, vec![], &mut results);
 
     results
 }
 
+#[allow(dead_code)]
 fn generate_combinations(
     current_opcode: u64,
     var_info: &[(&str, u8, u8, &BindingValue)],
@@ -475,6 +507,60 @@ fn generate_combinations(
                 new_bindings.push((var_name.to_string(), var_ident, substituted));
 
                 generate_combinations(new_opcode, var_info, index + 1, new_bindings, results);
+            }
+        }
+    }
+}
+
+fn generate_combinations_owned(
+    current_opcode: u64,
+    var_info: &[(&str, u8, u8, BindingValue)],
+    index: usize,
+    current_bindings: Vec<(String, Ident, TokenStream2)>,
+    results: &mut Vec<(u64, Vec<(String, Ident, TokenStream2)>)>,
+) {
+    if index >= var_info.len() {
+        results.push((current_opcode, current_bindings));
+        return;
+    }
+
+    let (var_name, bit_pos, num_bits, binding_value) = &var_info[index];
+
+    match binding_value {
+        BindingValue::Mappings(mappings) => {
+            // Manual mapping: expand all bit patterns
+            for mapping in mappings {
+                let bits_value =
+                    u64::from_str_radix(&mapping.bits, 2).expect("Invalid binary string");
+                let new_opcode = current_opcode | (bits_value << bit_pos);
+
+                let mut new_bindings = current_bindings.clone();
+                let variant = &mapping.variant;
+                new_bindings.push((
+                    var_name.to_string(),
+                    format_ident!("{}", var_name),
+                    quote! { #variant },
+                ));
+
+                generate_combinations_owned(new_opcode, var_info, index + 1, new_bindings, results);
+            }
+        }
+        BindingValue::ConstFn(fn_expr) => {
+            // Const function: expand all possible bit values
+            let max_value = (1u64 << num_bits) - 1;
+            for bits_value in 0..=max_value {
+                let new_opcode = current_opcode | (bits_value << bit_pos);
+
+                let mut new_bindings = current_bindings.clone();
+                let var_ident = format_ident!("{}", var_name);
+
+                // Substitute the variable with the bit value in the expression
+                // The expression is like "translate_register(r)" and we need to replace 'r' with the actual value
+                let substituted = substitute_variable(fn_expr, var_name, bits_value);
+
+                new_bindings.push((var_name.to_string(), var_ident, substituted));
+
+                generate_combinations_owned(new_opcode, var_info, index + 1, new_bindings, results);
             }
         }
     }
@@ -533,7 +619,7 @@ fn make_full_mask(bit_width: usize) -> u64 {
 fn generate_handler_call(
     handler: &HandlerSpec,
     bindings: &[(String, Ident, TokenStream2)],
-    _where_clause: &Option<WhereClause>,
+    where_clause: &Option<WhereClause>,
 ) -> TokenStream2 {
     let handler_name = &handler.name;
 
@@ -541,7 +627,7 @@ fn generate_handler_call(
         .generics
         .iter()
         .map(|arg| match arg {
-            GenericArg::Variable {
+            GenericArg::TypedVariable {
                 enum_type,
                 var_name,
             } => {
@@ -559,6 +645,40 @@ fn generate_handler_call(
                 if value_str.chars().all(|c| c.is_alphanumeric() || c == '_') {
                     // Simple variant name, add enum prefix
                     quote! { { #enum_type::#value } }
+                } else {
+                    // Already a complex expression (function call), wrap in braces
+                    quote! { { #value } }
+                }
+            }
+            GenericArg::UntypedVariable { var_name } => {
+                // Find the value for this variable
+                let value = bindings
+                    .iter()
+                    .find(|(name, _, _)| name == var_name)
+                    .map(|(_, _, value)| value)
+                    .unwrap_or_else(|| {
+                        panic!("Variable '{}' not found in where clause bindings", var_name)
+                    });
+
+                // Look up the type from the where clause
+                let enum_type = where_clause.as_ref().and_then(|wc| {
+                    wc.bindings
+                        .iter()
+                        .find(|b| &b.name == var_name)
+                        .and_then(|b| b._enum_type.as_ref())
+                });
+
+                // Check if the value is a simple identifier (enum variant)
+                let value_str = value.to_string();
+                if value_str.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    // Simple variant name
+                    if let Some(enum_type) = enum_type {
+                        // Add enum prefix if type is known
+                        quote! { { #enum_type::#value } }
+                    } else {
+                        // No type annotation, just use the value (should be a const expression)
+                        quote! { { #value } }
+                    }
                 } else {
                     // Already a complex expression (function call), wrap in braces
                     quote! { { #value } }
@@ -606,11 +726,16 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
             .unwrap_or(&[]);
 
         // Check if pattern has variables that need expansion
+        // Variables can be:
+        // 1. Defined in where clause (with mapping or const fn)
+        // 2. Not in where clause (use raw bit value as u8)
         let has_expandable_vars = bindings
             .iter()
             .any(|b| pattern.variables.contains_key(&b.name));
 
-        if has_expandable_vars {
+        let has_any_vars = !pattern.variables.is_empty();
+
+        if has_expandable_vars || has_any_vars {
             // Pattern with variables, expand all combinations
             let variants = generate_opcode_variants(&pattern, bindings);
 

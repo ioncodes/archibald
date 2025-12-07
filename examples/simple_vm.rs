@@ -98,18 +98,18 @@ archibald::instruction_table! {
     context = Vm;
 
     // ADD r0-r3, imm
-    "11rr'____" => impl_add<Register::{r}> where {
+    "11rr'____" => impl_add<{r}> where {
         r: Register = { 0b00 => R0, 0b01 => R1, 0b10 => R2, 0b11 => R3 }
     };
 
     // MOVE r0-r3, r0-r3
-    "0010'ddss" => impl_move<Register::{d}, Register::{s}> where {
+    "0010'ddss" => impl_move<{d}, {s}> where {
         d: Register = { 0b00 => R0, 0b01 => R1, 0b10 => R2, 0b11 => R3 },
         s: Register = { 0b00 => R0, 0b01 => R1, 0b10 => R2, 0b11 => R3 }
     };
 
     // LOAD r0-r3, imm
-    "01dd'____" => impl_load<Register::{d}> where {
+    "01dd'____" => impl_load<{d}> where {
         d: Register = { 0b00 => R0, 0b01 => R1, 0b10 => R2, 0b11 => R3 }
     };
 }
