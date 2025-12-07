@@ -2,6 +2,10 @@
 name = "archibald"
 version = "0.1.0"
 edition = "2024"
+license = "MPL-2.0"
+description = "High-performance instruction decoder generator using const generics for compile-time branch elimination"
+repository = "https://github.com/ioncodes/archibald"
+documentation = "https://archibald.layle.dev"
 
 [lib]
 proc-macro = true
