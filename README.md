@@ -33,6 +33,7 @@ pub const fn bit_to_bool(bit: u8) -> bool { bit != 0 }
 
 archibald::instruction_table! {
     type Opcode = u8;
+    
     dispatcher = dispatch;
     context = Cpu;
 
