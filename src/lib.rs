@@ -43,7 +43,7 @@
 //!
 //! instruction_table! {
 //!     type Opcode = u8;
-//! 
+//!
 //!     dispatcher = dispatch;
 //!     context = Cpu;
 //!
@@ -145,7 +145,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use std::collections::HashMap;
 use syn::{
-    Ident, LitInt, LitStr, Token, Type, braced,
+    Ident, LitInt, LitStr, Path, Token, Type, braced,
     parse::{Parse, ParseStream},
     parse_macro_input,
     punctuated::Punctuated,
@@ -204,8 +204,8 @@ enum BindingValue {
 struct VariableBinding {
     /// Variable name (e.g., "mm", "r", "dd")
     name: String,
-    /// Optional type annotation for adding enum prefixes (e.g., `Register`, `Mode`)
-    enum_type: Option<Ident>,
+    /// Optional type annotation for adding enum prefixes (e.g., `Register`, `Mode`, `m68k::Direction`)
+    enum_type: Option<Path>,
     /// The binding value (manual mapping or const function)
     value: BindingValue,
 }
@@ -218,7 +218,31 @@ impl Parse for VariableBinding {
         // Optional type annotation
         let enum_type = if input.peek(Token![:]) {
             input.parse::<Token![:]>()?;
-            Some(input.parse()?)
+
+            // Parse path manually to avoid consuming tokens beyond the type
+            let mut segments = Punctuated::new();
+
+            // Parse first segment
+            let first_ident: Ident = input.parse()?;
+            segments.push(syn::PathSegment {
+                ident: first_ident,
+                arguments: syn::PathArguments::None,
+            });
+
+            // Parse additional segments separated by `::`
+            while input.peek(Token![::]) {
+                input.parse::<Token![::]>()?;
+                let ident: Ident = input.parse()?;
+                segments.push(syn::PathSegment {
+                    ident,
+                    arguments: syn::PathArguments::None,
+                });
+            }
+
+            Some(Path {
+                leading_colon: None,
+                segments,
+            })
         } else {
             None
         };
@@ -283,16 +307,42 @@ impl Parse for WhereClause {
 /// - `load<{r}>` - single variable (type from where clause)
 /// - `move_reg<{d}, {s}>` - multiple variables
 /// - `alu<{op}>` - variable without where clause (primitive type)
+/// - `m68k::shift_left` - path to handler function
 struct HandlerSpec {
-    /// Handler function name
-    name: Ident,
+    /// Handler function name (can be a path like `m68k::shift_left`)
+    name: Path,
     /// Variable names from const generic arguments (e.g., ["r"], ["d", "s"])
     generics: Vec<String>,
 }
 
 impl Parse for HandlerSpec {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let name: Ident = input.parse()?;
+        // Parse path manually to avoid consuming the custom generic syntax <{var}>
+        // We want to parse: `ident`, `ident::ident`, `ident::ident::ident`, etc.
+        // But NOT the `<{...}>` part which comes after
+        let mut segments = Punctuated::new();
+
+        // Parse first segment
+        let first_ident: Ident = input.parse()?;
+        segments.push(syn::PathSegment {
+            ident: first_ident,
+            arguments: syn::PathArguments::None,
+        });
+
+        // Parse additional segments separated by `::`
+        while input.peek(Token![::]) {
+            input.parse::<Token![::]>()?;
+            let ident: Ident = input.parse()?;
+            segments.push(syn::PathSegment {
+                ident,
+                arguments: syn::PathArguments::None,
+            });
+        }
+
+        let name = Path {
+            leading_colon: None,
+            segments,
+        };
 
         let generics = if input.peek(Token![<]) {
             input.parse::<Token![<]>()?;
@@ -367,8 +417,10 @@ impl Parse for InstructionEntry {
 ///
 /// Contains all metadata and instruction entries that define the decoder.
 struct InstructionTable {
-    /// The opcode type (u8, u16, u32, or u64)
+    /// The opcode type (u8, u16, u32, or u64) used for pattern matching
     opcode_type: Type,
+    /// Optional type that handlers receive (converted from opcode_type)
+    handler_opcode_type: Option<Type>,
     /// Name of the generated dispatcher function
     dispatcher_name: Ident,
     /// Type of the context parameter passed to handlers
@@ -386,17 +438,40 @@ impl Parse for InstructionTable {
         let opcode_type: Type = input.parse()?;
         input.parse::<Token![;]>()?;
 
-        // dispatcher = dispatch;
-        let _: Ident = input.parse()?; // "dispatcher"
-        input.parse::<Token![=]>()?;
-        let dispatcher_name: Ident = input.parse()?;
-        input.parse::<Token![;]>()?;
+        // Optional: handler_opcode = Instruction;
+        let mut handler_opcode_type = None;
+        let mut dispatcher_name = None;
+        let mut context_type = None;
 
-        // context = Cpu;
-        let _: Ident = input.parse()?; // "context"
-        input.parse::<Token![=]>()?;
-        let context_type: Type = input.parse()?;
-        input.parse::<Token![;]>()?;
+        // Parse configuration lines in any order
+        while input.peek(Ident) && !input.peek(LitStr) {
+            let ident: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+
+            match ident.to_string().as_str() {
+                "handler_opcode" => {
+                    let handler_type: Type = input.parse()?;
+                    handler_opcode_type = Some(handler_type);
+                }
+                "dispatcher" => {
+                    let name: Ident = input.parse()?;
+                    dispatcher_name = Some(name);
+                }
+                "context" => {
+                    let ctx_type: Type = input.parse()?;
+                    context_type = Some(ctx_type);
+                }
+                _ => {
+                    return Err(syn::Error::new(ident.span(), "Unknown configuration key"));
+                }
+            }
+            input.parse::<Token![;]>()?;
+        }
+
+        let dispatcher_name = dispatcher_name
+            .ok_or_else(|| syn::Error::new(input.span(), "Missing 'dispatcher' configuration"))?;
+        let context_type = context_type
+            .ok_or_else(|| syn::Error::new(input.span(), "Missing 'context' configuration"))?;
 
         // Parse instruction entries
         let mut entries = Vec::new();
@@ -407,6 +482,7 @@ impl Parse for InstructionTable {
 
         Ok(InstructionTable {
             opcode_type,
+            handler_opcode_type,
             dispatcher_name,
             context_type,
             entries,
@@ -542,16 +618,72 @@ fn generate_opcode_variants(
         }
     }
 
+    // Collect phantom variables (bindings that don't correspond to pattern variables)
+    // These are constant expressions that should be added to every variant
+    let mut phantom_bindings: Vec<(String, Ident, TokenStream2)> = Vec::new();
+    for binding in bindings {
+        if !pattern.variables.contains_key(&binding.name) {
+            // This is a phantom variable - evaluate it as a constant
+            let var_ident = format_ident!("{}", binding.name);
+            let value = match &binding.value {
+                BindingValue::Mappings(mappings) => {
+                    // For phantom variables with manual mappings, just use the first variant
+                    // (typically there should only be one for phantom variables)
+                    if mappings.len() != 1 {
+                        panic!(
+                            "Phantom variable '{}' should have exactly one mapping value",
+                            binding.name
+                        );
+                    }
+                    let variant = &mappings[0].variant;
+                    if let Some(enum_type) = &binding.enum_type {
+                        quote! { #enum_type::#variant }
+                    } else {
+                        quote! { #variant }
+                    }
+                }
+                BindingValue::ConstFn(expr) => {
+                    // Const expression - use as-is (no variables to substitute)
+                    expr.clone()
+                }
+            };
+            phantom_bindings.push((binding.name.clone(), var_ident, value));
+        }
+    }
+
     if var_info.is_empty() {
-        // No variables, just return the base pattern
-        return vec![(pattern.value, vec![])];
+        // No pattern variables, just return the base pattern with phantom bindings
+        return vec![(pattern.value, phantom_bindings)];
     }
 
     // Recursively generate all combinations of variable values
     let mut results = Vec::new();
-    generate_combinations_owned(pattern.value, &var_info, 0, vec![], &mut results);
+    generate_combinations(
+        pattern.value,
+        &var_info,
+        0,
+        vec![],
+        HashMap::new(),
+        &mut results,
+    );
+
+    // Add phantom bindings to all results
+    if !phantom_bindings.is_empty() {
+        for (_opcode, bindings_vec) in &mut results {
+            bindings_vec.extend(phantom_bindings.clone());
+        }
+    }
 
     results
+}
+
+/// Holds raw binding information before substitution
+#[derive(Clone)]
+enum RawBinding {
+    /// Manual enum variant mapping
+    Variant(TokenStream2),
+    /// Const function expression that needs variable substitution
+    ConstFnExpr(TokenStream2),
 }
 
 /// Recursively generates all combinations of variable assignments.
@@ -559,15 +691,32 @@ fn generate_opcode_variants(
 /// This expands the cartesian product of all possible variable values.
 /// For manual mappings, it uses the explicit variant list.
 /// For const functions, it generates all possible bit values (0 to 2^num_bits - 1).
-fn generate_combinations_owned(
+fn generate_combinations(
     current_opcode: u64,
     var_info: &[(&str, u8, u8, BindingValue)],
     index: usize,
-    current_bindings: Vec<(String, Ident, TokenStream2)>,
+    current_bindings: Vec<(String, Ident, RawBinding)>,
+    current_bit_values: HashMap<String, u64>,
     results: &mut Vec<(u64, Vec<(String, Ident, TokenStream2)>)>,
 ) {
     if index >= var_info.len() {
-        results.push((current_opcode, current_bindings));
+        // At the leaf: all variables have been expanded
+        // Now substitute all variables in const function expressions
+        let final_bindings: Vec<(String, Ident, TokenStream2)> = current_bindings
+            .into_iter()
+            .map(|(name, ident, raw_binding)| {
+                let value = match raw_binding {
+                    RawBinding::Variant(v) => v,
+                    RawBinding::ConstFnExpr(expr) => {
+                        // Substitute all variables in the expression
+                        substitute_all_variables(&expr, &current_bit_values)
+                    }
+                };
+                (name, ident, value)
+            })
+            .collect();
+
+        results.push((current_opcode, final_bindings));
         return;
     }
 
@@ -586,10 +735,20 @@ fn generate_combinations_owned(
                 new_bindings.push((
                     var_name.to_string(),
                     format_ident!("{}", var_name),
-                    quote! { #variant },
+                    RawBinding::Variant(quote! { #variant }),
                 ));
 
-                generate_combinations_owned(new_opcode, var_info, index + 1, new_bindings, results);
+                let mut new_bit_values = current_bit_values.clone();
+                new_bit_values.insert(var_name.to_string(), bits_value);
+
+                generate_combinations(
+                    new_opcode,
+                    var_info,
+                    index + 1,
+                    new_bindings,
+                    new_bit_values,
+                    results,
+                );
             }
         }
         BindingValue::ConstFn(fn_expr) => {
@@ -601,41 +760,59 @@ fn generate_combinations_owned(
                 let mut new_bindings = current_bindings.clone();
                 let var_ident = format_ident!("{}", var_name);
 
-                // Substitute the variable with the bit value in the expression
-                // The expression is like "translate_register(r)" and we need to replace 'r' with the actual value
-                let substituted = substitute_variable(fn_expr, var_name, bits_value);
+                // Store the raw expression - we'll substitute later when we have all bit values
+                new_bindings.push((
+                    var_name.to_string(),
+                    var_ident,
+                    RawBinding::ConstFnExpr(fn_expr.clone()),
+                ));
 
-                new_bindings.push((var_name.to_string(), var_ident, substituted));
+                let mut new_bit_values = current_bit_values.clone();
+                new_bit_values.insert(var_name.to_string(), bits_value);
 
-                generate_combinations_owned(new_opcode, var_info, index + 1, new_bindings, results);
+                generate_combinations(
+                    new_opcode,
+                    var_info,
+                    index + 1,
+                    new_bindings,
+                    new_bit_values,
+                    results,
+                );
             }
         }
     }
 }
 
-/// Substitutes a variable name with a concrete bit value in a token stream.
+/// Substitutes multiple variables in a token stream.
 ///
-/// Used for const function bindings like `decode_mode(m)`. This replaces the
-/// variable identifier `m` with a literal value like `0u8`, `1u8`, etc.
+/// Used for const functions that reference multiple variables like `decode_mode(m, x)`.
+/// This replaces all variable identifiers with their concrete bit values.
 ///
-/// Recursively processes token groups to handle complex expressions.
-fn substitute_variable(tokens: &TokenStream2, var_name: &str, bit_value: u64) -> TokenStream2 {
-    let var_ident = format_ident!("{}", var_name);
-    let bit_lit = proc_macro2::Literal::u8_suffixed(bit_value as u8);
-
+/// # Arguments
+/// * `tokens` - The token stream to process (e.g., the const function call)
+/// * `var_bit_values` - Map of variable names to their bit values
+fn substitute_all_variables(
+    tokens: &TokenStream2,
+    var_bit_values: &HashMap<String, u64>,
+) -> TokenStream2 {
     let mut result = TokenStream2::new();
 
     for tt in tokens.clone().into_iter() {
         match tt {
-            proc_macro2::TokenTree::Ident(ref ident) if ident == &var_ident => {
-                // Replace variable with bit value
-                result.extend(std::iter::once(proc_macro2::TokenTree::Literal(
-                    bit_lit.clone(),
-                )));
+            proc_macro2::TokenTree::Ident(ref ident) => {
+                let ident_str = ident.to_string();
+                if let Some(&bit_value) = var_bit_values.get(&ident_str) {
+                    // Replace variable with bit value
+                    let bit_lit = proc_macro2::Literal::u8_suffixed(bit_value as u8);
+                    result.extend(std::iter::once(proc_macro2::TokenTree::Literal(bit_lit)));
+                } else {
+                    // Keep the identifier as-is
+                    result.extend(std::iter::once(tt));
+                }
             }
             proc_macro2::TokenTree::Group(group) => {
                 // Recursively process grouped tokens
-                let inner = substitute_variable(&group.stream(), var_name, bit_value);
+                let inner = substitute_all_variables(&group.stream(), var_bit_values);
                 let new_group = proc_macro2::Group::new(group.delimiter(), inner);
                 result.extend(std::iter::once(proc_macro2::TokenTree::Group(new_group)));
             }
@@ -678,6 +855,7 @@ fn generate_handler_call(
     handler: &HandlerSpec,
     bindings: &[(String, Ident, TokenStream2)],
     where_clause: &Option<WhereClause>,
+    handler_opcode_type: &Option<Type>,
 ) -> TokenStream2 {
     let handler_name = &handler.name;
 
@@ -720,10 +898,17 @@ fn generate_handler_call(
         })
         .collect();
 
-    if generic_args.is_empty() {
-        quote! { #handler_name(ctx, opcode) }
+    // Convert opcode if handler_opcode_type is specified
+    let opcode_arg = if let Some(handler_type) = handler_opcode_type {
+        quote! { #handler_type(opcode) }
     } else {
-        quote! { #handler_name::<#(#generic_args),*>(ctx, opcode) }
+        quote! { opcode }
+    };
+
+    if generic_args.is_empty() {
+        quote! { #handler_name(ctx, #opcode_arg) }
+    } else {
+        quote! { #handler_name::<#(#generic_args),*>(ctx, #opcode_arg) }
     }
 }
 
@@ -737,7 +922,7 @@ fn generate_handler_call(
 /// ```ignore
 /// instruction_table! {
 ///     type Opcode = u8;           // Opcode type (u8, u16, u32, or u64)
-/// 
+///
 ///     dispatcher = dispatch;      // Name of generated function
 ///     context = Cpu;              // Type passed to handlers
 ///
@@ -811,8 +996,12 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
                 if pattern.wildcard_bits != 0 {
                     // Pattern has wildcards - use guard-based match
                     // E.g., "11rr'____" with r=R0 matches 0b1100_0000..0b1100_1111
-                    let handler_call =
-                        generate_handler_call(&entry.handler, &var_bindings, &entry.where_clause);
+                    let handler_call = generate_handler_call(
+                        &entry.handler,
+                        &var_bindings,
+                        &entry.where_clause,
+                        &table.handler_opcode_type,
+                    );
 
                     // Skip if already covered by an exact match
                     let full_mask = make_full_mask(bit_width);
@@ -837,6 +1026,7 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
                             &entry.handler,
                             &var_bindings,
                             &entry.where_clause,
+                            &table.handler_opcode_type,
                         );
                         let opcode_lit = make_literal(opcode, bit_width);
                         match_arms.push(quote! {
@@ -850,7 +1040,12 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
             // Wildcard pattern with no variable bindings - single masked match
             let mask = pattern.mask;
             let value = pattern.value;
-            let handler_call = generate_handler_call(&entry.handler, &[], &entry.where_clause);
+            let handler_call = generate_handler_call(
+                &entry.handler,
+                &[],
+                &entry.where_clause,
+                &table.handler_opcode_type,
+            );
 
             let mask_lit = make_literal(mask, bit_width);
             let value_lit = make_literal(value, bit_width);
@@ -864,7 +1059,12 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
             let full_mask = make_full_mask(bit_width);
             let key = (full_mask, opcode);
             if !seen_patterns.contains(&key) {
-                let handler_call = generate_handler_call(&entry.handler, &[], &entry.where_clause);
+                let handler_call = generate_handler_call(
+                    &entry.handler,
+                    &[],
+                    &entry.where_clause,
+                    &table.handler_opcode_type,
+                );
                 let opcode_lit = make_literal(opcode, bit_width);
                 match_arms.push(quote! {
                     #opcode_lit => { #handler_call }
@@ -877,7 +1077,8 @@ pub fn instruction_table(input: TokenStream) -> TokenStream {
     // Generate the dispatcher function
     let expanded = quote! {
         #[inline]
-        pub fn #dispatcher_name(ctx: &mut #context_type, opcode: #opcode_type) {
+        pub fn #dispatcher_name(ctx: &mut #context_type, opcode: impl Into<#opcode_type>) {
+            let opcode = opcode.into();
             match opcode {
                 #(#match_arms)*
                 _ => panic!("Unhandled opcode: 0x{:02X}", opcode),
